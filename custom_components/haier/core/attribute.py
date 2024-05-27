@@ -54,7 +54,16 @@ class V1SpecAttributeParser(HaierAttributeParser, ABC):
         # 没有value的attribute后续无法正常使用，所以需要过滤掉
         if 'value' not in attribute:
             return None
-
+        
+        if attribute['name'] in ['rapidMode', 'sterilizationStatus', 'autoPowerOffStatus']:
+            return self._parse_as_switch(attribute)
+        
+        if attribute['name'] == 'targetTemperature':
+           return self._parse_as_number(attribute)
+        
+        if attribute['name'] == 'scene':
+           return self._parse_as_select(attribute)
+            
         if not attribute['writable'] and attribute['readable']:
             return self._parse_as_sensor(attribute)
 
