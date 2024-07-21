@@ -6,6 +6,7 @@ import logging
 import random
 import threading
 import time
+import uuid
 import zlib
 from typing import List
 from urllib.parse import urlparse
@@ -14,15 +15,16 @@ import aiohttp
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers.aiohttp_client import async_get_clientsession
 
-from .const import EVENT_DEVICE_CONTROL, EVENT_DEVICE_DATA_CHANGED, EVENT_WSS_GATEWAY_STATUS_CHANGED
 from .device import HaierDevice
+from .event import EVENT_DEVICE_CONTROL, EVENT_DEVICE_DATA_CHANGED, EVENT_GATEWAY_STATUS_CHANGED
+from .event import listen_event, fire_event
 
 _LOGGER = logging.getLogger(__name__)
 
 APP_ID = 'MB-SHEZJAPPWXXCX-0000'
 APP_KEY = '79ce99cc7f9804663939676031b8a427'
-APP_VERSION = '5.3.0'
 
+REFRESH_TOKEN_API = 'https://zj.haier.net/api-gw/oauthserver/account/v1/refreshToken'
 GET_USER_INFO_API = 'https://account-api.haier.net/v2/haier/userinfo'
 GET_DEVICES_API = 'https://uws.haier.net/uds/v1/protected/deviceinfos'
 GET_WSS_GW_API = 'https://uws.haier.net/gmsWS/wsag/assign'
@@ -31,6 +33,27 @@ GET_DIGITAL_MODEL_API = 'https://uws.haier.net/shadow/v1/devdigitalmodels'
 
 def random_str(length: int = 32) -> str:
     return ''.join(random.choice('abcdef1234567890') for _ in range(length))
+
+
+class TokenInfo:
+
+    def __init__(self, token: str, refresh_token: str, expires_in: int):
+        self._token = token
+        self._refresh_token = refresh_token
+        self._expires_in = expires_in
+
+    @property
+    def token(self) -> str:
+        return self._token
+
+    @property
+    def refresh_token(self) -> str:
+        return self._refresh_token
+
+    @property
+    def expires_in(self) -> int:
+        return self._expires_in
+
 
 class HaierClientException(Exception):
     pass
@@ -47,6 +70,27 @@ class HaierClient:
     @property
     def hass(self):
         return self._hass
+
+    async def refresh_token(self, refresh_token: str) -> TokenInfo:
+        """
+        刷新token
+        :return:
+        """
+        payload = {
+            'refreshToken': refresh_token
+        }
+
+        headers = await self._generate_common_headers(REFRESH_TOKEN_API, json.dumps(payload))
+        async with self._session.post(url=REFRESH_TOKEN_API, headers=headers, json=payload) as response:
+            content = await response.json(content_type=None)
+            self._assert_response_successful(content)
+
+            token_info = content['data']['tokenInfo']
+            return TokenInfo(
+                token_info['accountToken'],
+                token_info['refreshToken'],
+                token_info['expiresIn']
+            )
 
     async def get_user_info(self) -> dict:
         """
@@ -113,9 +157,10 @@ class HaierClient:
 
             return json.loads(content['detailInfo'][deviceId])['attributes']
 
-    async def listen_devices(self, targetDevices: List[HaierDevice]):
+    async def listen_devices(self, targetDevices: List[HaierDevice], signal: threading.Event):
         """
 
+        :param signal:
         :param targetDevices: 需要监听数据变化的设备
         :return:
         """
@@ -123,15 +168,23 @@ class HaierClient:
 
         _LOGGER.debug("WSSGateway: %s", server)
 
-        # https://docs.aiohttp.org/en/stable/client_quickstart.html#aiohttp-client-websockets
+        # 集成reload后会有一段时间内同时存在两个listen_device，上一次监听退出后会发送EVENT_GATEWAY_STATUS_CHANGED导致实体变为不可用
+        # 加入process_id则是为了方便识别出哪一个才是正在运行中的listen_device
+        process_id = str(uuid.uuid4())
+        self._hass.data['current_listen_devices_process_id'] = process_id
+
         agClientId = self._token
-        while True:
-            url = '{}/userag?token={}&agClientId={}'.format(server, self._token, agClientId)
-            async with self._session.ws_connect(url) as ws:
-                try:
+        while not signal.is_set():
+            heartbeat_signal = threading.Event()
+            try:
+                url = '{}/userag?token={}&agClientId={}'.format(server, self._token, agClientId)
+                _LOGGER.info('url: {}'.format(url))
+                async with self._session.ws_connect(url) as ws:
                     # 每60秒发送一次心跳包
-                    event = threading.Event()
-                    self._hass.async_create_background_task(self._send_heartbeat(ws, agClientId, event), 'haier-wss-send_heartbeat')
+                    self._hass.async_create_background_task(
+                        self._send_heartbeat(ws, agClientId, heartbeat_signal),
+                        'haier-wss-heartbeat'
+                    )
 
                     # 订阅设备状态
                     await ws.send_str(json.dumps({
@@ -145,9 +198,10 @@ class HaierClient:
                     # 监听事件总线来的控制命令
                     async def control_callback(e):
                         await self._send_command(ws, agClientId, e.data['deviceId'], e.data['attributes'])
-                    cancel_control_listen = self._hass.bus.async_listen(EVENT_DEVICE_CONTROL, control_callback)
 
-                    self._hass.bus.fire(EVENT_WSS_GATEWAY_STATUS_CHANGED, {
+                    cancel_control_listen = listen_event(self._hass, EVENT_DEVICE_CONTROL, control_callback)
+
+                    fire_event(self._hass, EVENT_GATEWAY_STATUS_CHANGED, {
                         'status': True
                     })
 
@@ -156,23 +210,28 @@ class HaierClient:
                             await self._parse_message(msg.data)
                         else:
                             _LOGGER.warning("收到未知类型的消息: {}".format(msg.type))
-                finally:
-                    cancel_control_listen()
-                    event.set()
-                    self._hass.bus.fire(EVENT_WSS_GATEWAY_STATUS_CHANGED, {
+
+                        if signal.is_set():
+                            _LOGGER.info('listen device stopped.')
+                            break
+            except:
+                _LOGGER.exception("Connection disconnected. Waiting to retry.")
+                await asyncio.sleep(30)
+            finally:
+                cancel_control_listen()
+                heartbeat_signal.set()
+                if process_id == self._hass.data['current_listen_devices_process_id']:
+                    fire_event(self._hass, EVENT_GATEWAY_STATUS_CHANGED, {
                         'status': False
                     })
+                else:
+                    _LOGGER.debug('process_id not match, skip...')
 
-            _LOGGER.debug("Connection disconnected. Waiting to retry.")
-            await asyncio.sleep(30)
+                _LOGGER.info('listen device stopped.')
 
     @staticmethod
     async def _send_heartbeat(ws, agClientId: str, event: threading.Event):
-        while True:
-            if event.is_set():
-                _LOGGER.info("Stop heartbeat...")
-                break
-
+        while not event.is_set():
             try:
                 await ws.send_str(json.dumps({
                     'agClientId': agClientId,
@@ -185,9 +244,11 @@ class HaierClient:
 
                 _LOGGER.debug('Sending heartbeat')
             except:
-                _LOGGER.error('Failed to send heartbeat')
+                _LOGGER.exception('Failed to send heartbeat')
 
             await asyncio.sleep(60)
+
+        _LOGGER.info("send heartbeat stopped")
 
     async def _parse_message(self, msg):
         msg = json.loads(msg)
@@ -256,7 +317,7 @@ class HaierClient:
 
             attributes[attribute['name']] = attribute['value']
 
-        self._hass.bus.async_fire(EVENT_DEVICE_DATA_CHANGED, {
+        fire_event(self._hass, EVENT_DEVICE_DATA_CHANGED, {
             'deviceId': deviceId,
             'attributes': attributes
         })
@@ -325,7 +386,6 @@ class HaierClient:
             'accessToken': self._token,
             'appId': APP_ID,
             'appKey': APP_KEY,
-            'appVersion': APP_VERSION,
             'clientId': self._client_id,
             'sequenceId': sequence_id,
             'sign': self._sign(APP_ID, APP_KEY, timestamp, body, api),

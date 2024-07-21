@@ -24,22 +24,19 @@ class HaierDevice:
 
     @property
     def name(self):
-        return self._raw_data['deviceName']
+        return self._raw_data['deviceName'] if 'deviceName' in self._raw_data else self.id
 
     @property
     def type(self):
-        return self._raw_data['deviceType']
+        return self._raw_data['deviceType'] if 'deviceType' in self._raw_data else None
 
     @property
     def product_code(self):
-        return self._raw_data['productCodeT']
+        return self._raw_data['productCodeT'] if 'productCodeT' in self._raw_data else None
 
     @property
     def product_name(self):
-        if 'productNameT' not in self._raw_data:
-            return ''
-
-        return self._raw_data['productNameT']
+        return self._raw_data['productNameT'] if 'productNameT' in self._raw_data else None
 
     @property
     def wifi_type(self):

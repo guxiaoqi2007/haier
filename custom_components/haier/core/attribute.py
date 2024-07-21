@@ -97,6 +97,12 @@ class V1SpecAttributeParser(HaierAttributeParser, ABC):
         if 'outWaterTemp' in all_attribute_keys and 'targetTemp' in all_attribute_keys and 'totalUseGasL' in all_attribute_keys:
             yield self._parse_as_gas_water_heater(attributes)
 
+        # 窗帘
+        if 'openDegree' in all_attribute_keys:
+            yield self._parse_as_cover(attributes)
+
+
+
     @staticmethod
     def _parse_as_sensor(attribute):
         if V1SpecAttributeParser._is_binary_attribute(attribute):
@@ -208,6 +214,21 @@ class V1SpecAttributeParser(HaierAttributeParser, ABC):
         return HaierAttribute('gas_water_heater', 'GasWaterHeater', Platform.WATER_HEATER, options, ext)
 
     @staticmethod
+    def _parse_as_cover(attributes: List[dict]):
+        for attr in attributes:
+            if attr["name"] == "openDegree":
+                step = attr['valueRange']['dataStep']
+        options = {
+            'native_min_value': float(step['minValue']),
+            'native_max_value': float(step['maxValue']),
+            'native_step': step['step']
+        }
+        ext = {
+            'customize': True,
+        }
+        return HaierAttribute('cover', 'Cover', Platform.COVER, options,ext)
+
+    @staticmethod
     def _is_binary_attribute(attribute):
         valueRange = attribute['valueRange']
 
@@ -232,7 +253,7 @@ class V1SpecAttributeParser(HaierAttributeParser, ABC):
             return SensorDeviceClass.WATER, UnitOfVolume.LITERS
 
         if '用气量' in attribute['desc']:
-            return SensorDeviceClass.GAS, UnitOfVolume.CUBIC_METERS
+            return SensorDeviceClass.GAS, UnitOfVolume.LITERS
 
         if '用电量' in attribute['desc']:
             return SensorDeviceClass.ENERGY, UnitOfEnergy.KILO_WATT_HOUR
